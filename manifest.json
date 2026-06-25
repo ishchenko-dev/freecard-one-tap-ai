@@ -1,0 +1,7 @@
+{
+  "package": "freecard_one_tap_ai",
+  "name": "FreeCard — One-Tap AI",
+  "human_version": "0.1.5-alpha",
+  "min_point_version": 1,
+  "max_point_version": 99
+}
