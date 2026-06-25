@@ -1,7 +1,7 @@
 # FreeCard — One-Tap AI
 
 Create an Anki card from any text in **one tap**. Select a word or phrase
-anywhere, press your global hotkey, and an AI provider builds a complete
+anywhere, press your global hotkey, and Google Gemini builds a complete
 flashcard (translation, definition, examples) and adds it to your deck.
 
 Free and open source (AGPLv3). No account, no subscription — just your own
@@ -11,7 +11,7 @@ free API key.
 
 - **One-tap capture** — global hotkey reads the clipboard/selection and
   generates a card without leaving the app you're reading in.
-- **Multiple AI providers** — Google Gemini or Groq, with configurable models.
+- **Powered by Google Gemini** — bring your own free API key; no account, no subscription.
 - **Custom prompts & presets** — control exactly how cards are formatted; the
   default produces a clean two-line Front/Back card.
 - **Language-learning extras** — optional Reverso translations & examples
