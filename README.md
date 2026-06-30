@@ -19,7 +19,7 @@ free API key.
 - **Smart adding** — duplicate detection and deck/note-type selection.
 - **Cross-platform** — macOS and Windows global hotkeys.
 
-> ⚠️ **Alpha (v0.1.5).** Early test build — expect rough edges. macOS tested;
+> ⚠️ **Alpha (v0.1.6).** Early test build — expect rough edges. macOS tested;
 > Windows is being tested. Please report bugs (see below).
 
 ## Installation
@@ -74,6 +74,14 @@ It does **not** include your API key (key-like strings are redacted before
 sending). The log may contain the word/phrase you were generating a card for.
 Reports go to the developer's private Telegram and are used only to fix bugs.
 If you'd rather not send anything, just close the window.
+
+### Anonymous usage stats
+
+To gauge how many people use FreeCard, the addon sends an **anonymous** ping (a
+random install id, the version, and your OS — **no personal data and no card
+content**) on startup and, throttled, when a card is generated. You can turn
+this off any time in **Settings → Feedback & support → "Send anonymous usage
+stats"**.
 
 ## Development & building
 

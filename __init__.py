@@ -8,7 +8,7 @@
 # AGPLv3 (the LICENSE file) for details.
 #
 # Bump the patch (last number) whenever you change this addon and sync to Anki; restart Anki to load code.
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
 import sys
 import subprocess
@@ -260,6 +260,101 @@ def _send_full_log_telegram(contact: str = "") -> "tuple[bool, str]":
         return False, str(e)
 
 
+# ---- Anonymous usage counter (opt-out) -------------------------------------
+# Reuses the same bot/chat as bug reports. Sends only an anonymous random install
+# id (no personal data, no card content) so the developer can gauge how many
+# people install/use the addon. Users can turn it off in settings.
+def _telemetry_enabled() -> bool:
+    try:
+        return bool(_get_config().get("telemetry_enabled", True))
+    except Exception:
+        return True
+
+
+def _get_install_id() -> str:
+    """Stable anonymous id for this install (random hex, created once)."""
+    try:
+        cfg = _get_config()
+        iid = str(cfg.get("install_id", "")).strip()
+        if not iid:
+            import uuid
+            iid = uuid.uuid4().hex[:12]
+            cfg["install_id"] = iid
+            _set_config(cfg)
+        return iid
+    except Exception:
+        return "unknown"
+
+
+def _send_stat(event: str, extra: str = "") -> None:
+    """Fire-and-forget anonymous stat ping to the developer's Telegram."""
+    if not _bug_reporting_enabled() or not _telemetry_enabled():
+        return
+
+    def _go() -> None:
+        try:
+            import urllib.parse
+            import urllib.request
+            iid = _get_install_id()
+            msg = f"📊 {event} | id={iid} | v{__version__} | {sys.platform}"
+            if extra:
+                msg += f" | {extra}"
+            data = urllib.parse.urlencode({"chat_id": _BUG_TG_CHAT, "text": msg[:500]}).encode("utf-8")
+            req = urllib.request.Request(
+                f"https://api.telegram.org/bot{_BUG_TG_TOKEN}/sendMessage", data=data, method="POST",
+            )
+            _tg_urlopen(req, timeout=12)
+        except Exception:
+            pass
+
+    try:
+        threading.Thread(target=_go, name="FreeCard-Stat", daemon=True).start()
+    except Exception:
+        pass
+
+
+def _stat_on_startup() -> None:
+    """On startup: a one-time 'new_install' ping, plus one 'active' heartbeat/day."""
+    if not _bug_reporting_enabled() or not _telemetry_enabled():
+        return
+    try:
+        import time as _t
+        cfg = _get_config()
+        is_new = not str(cfg.get("install_id", "")).strip()
+        _get_install_id()  # ensure the id exists (on the main thread)
+        if is_new:
+            _send_stat("new_install")
+        today = _t.strftime("%Y-%m-%d")
+        cfg = _get_config()
+        if str(cfg.get("stat_last_day", "")) != today:
+            cfg["stat_last_day"] = today
+            _set_config(cfg)
+            total = int(cfg.get("stat_gen_total", 0) or 0)
+            _send_stat("active", f"cards={total}")
+    except Exception:
+        pass
+
+
+def _stat_on_generation() -> None:
+    """Count a successful generation; ping (throttled to 30 min) so live activity
+    is visible without spamming the chat."""
+    if not _bug_reporting_enabled() or not _telemetry_enabled():
+        return
+    try:
+        import time as _t
+        cfg = _get_config()
+        total = int(cfg.get("stat_gen_total", 0) or 0) + 1
+        last = float(cfg.get("stat_last_ping_ts", 0) or 0)
+        now = _t.time()
+        cfg["stat_gen_total"] = total
+        cfg["stat_last_ping_ts"] = now
+        _set_config(cfg)
+        if now - last >= 1800:
+            _send_stat("request", f"cards={total}")
+    except Exception:
+        pass
+
+
 def _classify_error(exc) -> "tuple[str, str]":
     """Map an exception to a user-facing (code, advice) pair so users can self-fix
     common problems."""
@@ -382,19 +477,27 @@ def _start_windows_hotkey_thread() -> None:
             return ord('X')
 
         cfg = _get_config()
-        combo = str(cfg.get("hotkey_combo", "ctrl+shift+x")).lower().strip()
+        combo = str(cfg.get("hotkey_combo", "ctrl+alt+t")).lower().strip()
         parts = [p.strip() for p in combo.split('+') if p.strip()]
-        key = parts[-1] if parts else 'x'
+        key = parts[-1] if parts else 't'
         mods = 0
         if any(p in ("ctrl", "control") for p in parts):
             mods |= MOD_CONTROL
         if any(p in ("shift",) for p in parts):
             mods |= MOD_SHIFT
-        if any(p in ("alt",) for p in parts):
+        # Accept macOS naming ("option"/"opt") as Alt on Windows.
+        if any(p in ("alt", "option", "opt") for p in parts):
             mods |= MOD_ALT
-        if any(p in ("win", "meta") for p in parts):
+        # macOS "cmd"/"command" has no Windows twin; map it (and win/meta) to the Win key.
+        if any(p in ("win", "meta", "cmd", "command") for p in parts):
             mods |= MOD_WIN
         key_vk = _vk_for_char(key)
+
+        # Never register a bare-key global hotkey: without a modifier we'd hijack a
+        # plain letter system-wide. A macOS-only combo like "cmd+option+t" used to
+        # collapse to just "T" on Windows and fire on every keypress — guard against it.
+        if mods == 0:
+            return
 
         # Register the hotkey (atom_id=1 is arbitrary but unique per process)
         atom_id = 1
@@ -596,7 +699,11 @@ _UI_STRINGS = {
     "section_feedback": "Feedback & support",
     "tip_feedback": "Send suggestions, or the full log if you hit a serious bug.",
     "feedback_intro": "Found a bug or have an idea? Tell the developer — replies come faster if you leave a contact.",
-    "feedback_contact_html": "Bug or question? Open a <a href=\"https://github.com/\">GitHub issue</a>, or message <b>@lineyka</b> on Telegram.",
+    "feedback_contact_html": "Bug or question? Open a <a href=\"https://github.com/ishchenko-dev/freecard-one-tap-ai/issues\">GitHub issue</a>, message <a href=\"https://t.me/Lineyka_x\">@Lineyka_x</a> on Telegram, or email <a href=\"mailto:ishchenko.dev@gmail.com\">ishchenko.dev@gmail.com</a>.",
+    "telemetry_label": "Send anonymous usage stats",
+    "telemetry_hint": "No personal data or card content — just an anonymous count that helps improve FreeCard.",
+    "feedback_contact_label": "Your contact (optional):",
+    "feedback_contact_ph": "Telegram @handle or email",
     "feedback_label": "Suggestion / feedback",
     "feedback_ph": "What would you improve? Any wishes?",
     "feedback_send": "Send feedback",
@@ -907,18 +1014,29 @@ def _build_content_prompt(cfg: dict) -> str:
             "translation in parentheses"
         )
     if n_ex > 0:
-        back_bits.append(
+        ex_line = (
             f"{n_ex} short natural example sentence(s); format each as: "
             f"<{src} sentence> — <{tgt} translation>"
         )
+        if extra:
+            ex_line += f". EVERY example sentence MUST fit this context/topic: {extra}"
+        back_bits.append(ex_line)
     if inc_pos:
         back_bits.append(f"the part of speech (in {tgt})")
     lines.append(
         "Back must contain, in this order separated by <br/><br/>: " + "; ".join(back_bits) + "."
     )
-    if extra:
-        lines.append(extra)
     lines.append("Keep everything short, simple and natural.")
+    if extra:
+        # The user's extra instructions are a HARD requirement — give them real
+        # weight (a weak model otherwise treats them as a throwaway hint). Tie them
+        # to the definition and examples so the WHOLE card follows the context.
+        lines.append(
+            "IMPORTANT — this is a strict requirement that applies to the WHOLE card "
+            "(the definition and EVERY example sentence, not just one of them): "
+            f"{extra}. Make the definition and all examples clearly relate to this; "
+            "do NOT produce generic or unrelated examples."
+        )
     return "\n".join(lines)
 
 
@@ -1102,6 +1220,7 @@ def _gemini_generate_card(
     model_id: Optional[str] = None,
 ) -> Tuple[str, str]:
     import json
+    import time
     import urllib.parse
     import urllib.request
     import urllib.error
@@ -1149,19 +1268,34 @@ def _gemini_generate_card(
         method="POST",
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            raw = resp.read().decode("utf-8")
-            _log(f"Gemini raw: {raw[:400]}")
-            data = json.loads(raw)
-    except urllib.error.HTTPError as e:
-        # Parse error response from Gemini API
-        error_message = _parse_gemini_error(e)
-        _log(f"Gemini HTTPError {e.code}: {error_message}")
-        raise RuntimeError(error_message)
-    except Exception as e:
-        _log(f"Gemini net error: {e}")
-        raise RuntimeError(f"Network error: {e}")
+    # Gemini's free tier occasionally returns transient errors (503 overloaded,
+    # 429 rate, 5xx). Retry a few times with a short backoff before giving up, so
+    # the first request after a cold start doesn't fail outright. This runs in the
+    # background generation worker, so the sleep does not block the UI.
+    _transient_codes = {429, 500, 502, 503, 504}
+    _max_attempts = 3
+    data = None
+    for _attempt in range(1, _max_attempts + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                raw = resp.read().decode("utf-8")
+                _log(f"Gemini raw: {raw[:400]}")
+                data = json.loads(raw)
+            break
+        except urllib.error.HTTPError as e:
+            # Parse error response from Gemini API
+            error_message = _parse_gemini_error(e)
+            _log(f"Gemini HTTPError {e.code} (attempt {_attempt}/{_max_attempts}): {error_message}")
+            if e.code in _transient_codes and _attempt < _max_attempts:
+                time.sleep(min(2 ** _attempt, 6))
+                continue
+            raise RuntimeError(error_message)
+        except Exception as e:
+            _log(f"Gemini net error (attempt {_attempt}/{_max_attempts}): {e}")
+            if _attempt < _max_attempts:
+                time.sleep(2)
+                continue
+            raise RuntimeError(f"Network error: {e}")
 
     # Extract text from candidates
     def _extract_text(obj: dict) -> str:
@@ -2087,7 +2221,9 @@ def _enqueue_generation_and_add(words: str) -> None:
             else:
                 platform = "google"
                 api_key = str(cfg.get("gemini_api_key", "")).strip() or DEFAULT_GEMINI_API_KEY
-                model_id = str(cfg.get("gemini_model", DEFAULT_GEMINI_MODEL)).strip() or DEFAULT_GEMINI_MODEL
+                # Gemini model is fixed to the single 3.1 option offered in the UI;
+                # ignore any stale saved value (older configs may hold gemini-2.5-*).
+                model_id = DEFAULT_GEMINI_MODEL
             # Build the content prompt from constructor settings (or raw prompt in
             # advanced mode). Falls back to the legacy default if it comes out empty.
             custom = _build_content_prompt(cfg)
@@ -2120,6 +2256,7 @@ def _enqueue_generation_and_add(words: str) -> None:
                 dt_ms = int((time.time() - t0) * 1000)
                 _log(f"API response ok in {dt_ms}ms front='{str(front)[:80]}' back='{str(back)[:80]}'")
                 _log(f"DEBUG: Generated front length: {len(front)}, back length: {len(back)}")
+                _stat_on_generation()
             except Exception as gen_exc:
                 _log_exc("card generation")
                 raise
@@ -2228,7 +2365,7 @@ def _read_clipboard_text() -> str:
     return ""
 
 
-def _macos_copy_and_get_text(max_wait_ms: int = 1500, poll_ms: int = 50) -> str:
+def _macos_copy_and_get_text(send_copy: bool = True, max_wait_ms: int = 1500, poll_ms: int = 50) -> str:
     """
     Simulate Cmd+C via System Events and wait for clipboard update via Qt clipboard.sequenceNumber().
     
@@ -2259,6 +2396,20 @@ def _macos_copy_and_get_text(max_wait_ms: int = 1500, poll_ms: int = 50) -> str:
                 return ""
 
         before_text = _pbpaste()
+        if not send_copy:
+            # Double-copy gesture: the user already pressed Cmd/Ctrl+C themselves, so
+            # the selection is ALREADY on the clipboard. Do NOT synthesize another
+            # Cmd+C — firing it while Cmd is still physically held can trigger a
+            # browser shortcut (e.g. view-source) instead of a copy. Just read it.
+            got = ""
+            start = time.time()
+            while (time.time() - start) * 1000 < 500:
+                got = _pbpaste()
+                if got:
+                    break
+                time.sleep(poll_ms / 1000.0)
+            _log(f"hotkey: captured (no synth) len={len(got)} preview={got[:40]!r}")
+            return got.strip()
         _log("hotkey: sending synthetic Cmd+C")
         _macos_send_cmd_c()
 
@@ -2429,12 +2580,12 @@ def _macos_global_tap_thread() -> None:
         last_copy_ms = 0
         tap = None  # assigned after the tap is created; referenced for re-enable
 
-        def _capture_async():
+        def _capture_async(send_copy: bool = True):
             # Heavy work (synthetic Cmd+C + clipboard polling) must NOT run inside
             # the event-tap callback, or macOS disables the tap by timeout. Run it
             # on a short-lived background thread so the callback returns instantly.
             try:
-                txt = _macos_copy_and_get_text()
+                txt = _macos_copy_and_get_text(send_copy=send_copy)
                 if txt:
                     _log("hotkey: enqueueing generation")
                     _enqueue_generation_and_add(txt)
@@ -2468,7 +2619,9 @@ def _macos_global_tap_thread() -> None:
                     _log(f"hotkey: copy-key seen dt={dt}ms flags={hex(flags)}")
                     if 120 <= dt <= 900:
                         _log("hotkey: double copy TRIGGERED")
-                        threading.Thread(target=_capture_async, daemon=True).start()
+                        # No synthetic Cmd+C here: the user's own double Cmd+C already
+                        # put the selection on the clipboard.
+                        threading.Thread(target=lambda: _capture_async(send_copy=False), daemon=True).start()
                         last_copy_ms = 0  # reset so a third press doesn't re-trigger
                     else:
                         last_copy_ms = now
@@ -2691,6 +2844,10 @@ class ApiSettingsDialog(QDialog):
         saved_model = str(cfg.get("groq_model" if platform == "groq" else "gemini_model", "")).strip()
         if not saved_model:
             saved_model = DEFAULT_GROQ_MODEL if platform == "groq" else DEFAULT_GEMINI_MODEL
+        # Google offers a single fixed model (3.1); drop any stale saved value
+        # (e.g. an older gemini-2.5-*) instead of re-adding it to the list.
+        if platform != "groq" and self.model_combo.findText(saved_model) < 0:
+            saved_model = DEFAULT_GEMINI_MODEL
         if self.model_combo.findText(saved_model) < 0:
             self.model_combo.addItem(saved_model)
         self.model_combo.setCurrentText(saved_model)
@@ -5349,7 +5506,7 @@ class AiCardReviewDialog(QDialog):
 
     def _maybe_attach_reverso(self, lookup_word: str) -> None:
         cfg = _get_config()
-        if not bool(cfg.get("reverso_panel_enabled", False)):
+        if not bool(cfg.get("reverso_panel_enabled", True)):
             return
         word = self._extract_lookup_word(lookup_word)
         if not word:
@@ -6242,6 +6399,9 @@ class AddCardDialog(QDialog):
         except Exception:
             pass
         form.addRow(contact_lbl)
+        self.feedback_contact_edit = QLineEdit(self)
+        self.feedback_contact_edit.setPlaceholderText(_t("feedback_contact_ph"))
+        form.addRow(_t("feedback_contact_label"), self.feedback_contact_edit)
         self.feedback_edit = QPlainTextEdit(self)
         self.feedback_edit.setPlaceholderText(_t("feedback_ph"))
         try:
@@ -6256,6 +6416,9 @@ class AddCardDialog(QDialog):
         self.full_log_btn.setToolTip(_t("feedback_full_log_tip"))
         qconnect(self.full_log_btn.clicked, self._on_send_full_log)
         form.addRow(self.full_log_btn)
+        self.telemetry_checkbox = QCheckBox(_t("telemetry_label"), self)
+        form.addRow(self.telemetry_checkbox)
+        form.addRow(self._hint_label(_t("telemetry_hint")))
         if not _bug_reporting_enabled():
             self.feedback_send_btn.setEnabled(False)
             self.full_log_btn.setEnabled(False)
@@ -6267,8 +6430,9 @@ class AddCardDialog(QDialog):
         self.scroll_area.setWidget(content)
         try:
             self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
-            # No horizontal scroll — content always fits the viewport width.
-            self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            # No horizontal scroll — content is constrained to the viewport width
+            # (long labels wrap, fields shrink) instead of overflowing to the right.
+            self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         except Exception:
             pass
 
@@ -6441,7 +6605,8 @@ class AddCardDialog(QDialog):
         if not text:
             showInfo(_t("feedback_empty"))
             return
-        ok, err = _send_feedback_telegram(text)
+        contact = self.feedback_contact_edit.text().strip()
+        ok, err = _send_feedback_telegram(text, contact)
         if ok:
             self.feedback_edit.setPlainText("")
             showInfo(_t("feedback_sent"))
@@ -6451,7 +6616,8 @@ class AddCardDialog(QDialog):
     def _on_send_full_log(self) -> None:
         if not askUser(_t("feedback_full_log_confirm")):
             return
-        ok, err = _send_full_log_telegram("")
+        contact = self.feedback_contact_edit.text().strip()
+        ok, err = _send_full_log_telegram(contact)
         if ok:
             showInfo(_t("feedback_full_log_sent"))
         else:
@@ -6461,6 +6627,12 @@ class AddCardDialog(QDialog):
         try:
             dlg = SetupWizard(self)
             dlg.exec()
+            # Repopulate deck combos first: the wizard may have created a NEW deck
+            # that isn't in the combos yet — without this the saved ai_deck_id won't
+            # match any item and the new deck won't show up in the list.
+            self._populate_decks()
+            self._populate_ai_decks()
+            self._populate_settings_decks()
             # Reload settings into the UI so wizard changes show immediately.
             self._load_config_into_ui()
             self._refresh_api_settings_summary()
@@ -6619,22 +6791,31 @@ class AddCardDialog(QDialog):
         return items
 
     def _populate_decks(self) -> None:
+        # Block signals while rebuilding: clear()/addItem() emit currentIndexChanged,
+        # and the deck-sync handlers would fire mid-repopulation, cascading across all
+        # three combos. On Windows/Qt that re-entrant storm can freeze the UI.
         items = self._get_all_decks()
+        self.deck_combo.blockSignals(True)
         self.deck_combo.clear()
         for name, deck_id in items:
             self.deck_combo.addItem(name, deck_id)
+        self.deck_combo.blockSignals(False)
 
     def _populate_ai_decks(self) -> None:
         items = self._get_all_decks()
+        self.ai_deck_combo.blockSignals(True)
         self.ai_deck_combo.clear()
         for name, deck_id in items:
             self.ai_deck_combo.addItem(name, deck_id)
+        self.ai_deck_combo.blockSignals(False)
 
     def _populate_settings_decks(self) -> None:
         items = self._get_all_decks()
+        self.settings_deck_combo.blockSignals(True)
         self.settings_deck_combo.clear()
         for name, deck_id in items:
             self.settings_deck_combo.addItem(name, deck_id)
+        self.settings_deck_combo.blockSignals(False)
 
     def _populate_models(self) -> None:
         col = mw.col
@@ -6750,9 +6931,10 @@ class AddCardDialog(QDialog):
             self._prompt_preset_index = 0
         # The actual preset display happens later (after the constructor widgets and
         # language combos are loaded, so the preview page reflects real settings).
-        self.reverso_panel_checkbox.setChecked(bool(cfg.get("reverso_panel_enabled", False)))
+        self.reverso_panel_checkbox.setChecked(bool(cfg.get("reverso_panel_enabled", True)))
         self.sidebar_visible_checkbox.setChecked(bool(cfg.get("sidebar_visible", True)))
         self.audio_panel_checkbox.setChecked(bool(cfg.get("audio_panel_enabled", True)))
+        self.telemetry_checkbox.setChecked(bool(cfg.get("telemetry_enabled", True)))
         _set_language_combo(self.reverso_src_edit, str(cfg.get("reverso_source_lang", REVERSO_DEFAULT_SRC)))
         _set_language_combo(self.reverso_tgt_edit, str(cfg.get("reverso_target_lang", REVERSO_DEFAULT_TGT)))
         # Double Ctrl+C gesture (default on)
@@ -6825,6 +7007,7 @@ class AddCardDialog(QDialog):
         cfg["reverso_panel_enabled"] = bool(self.reverso_panel_checkbox.isChecked())
         cfg["sidebar_visible"] = bool(self.sidebar_visible_checkbox.isChecked())
         cfg["audio_panel_enabled"] = bool(self.audio_panel_checkbox.isChecked())
+        cfg["telemetry_enabled"] = bool(self.telemetry_checkbox.isChecked())
         cfg["reverso_source_lang"] = _language_combo_code(self.reverso_src_edit, REVERSO_DEFAULT_SRC)
         cfg["reverso_target_lang"] = _language_combo_code(self.reverso_tgt_edit, REVERSO_DEFAULT_TGT)
         # Card-content constructor
@@ -6945,7 +7128,7 @@ class AddCardDialog(QDialog):
             platform_title = "Groq"
         else:
             platform = "google"
-            model = str(cfg.get("gemini_model", DEFAULT_GEMINI_MODEL)).strip() or DEFAULT_GEMINI_MODEL
+            model = DEFAULT_GEMINI_MODEL  # fixed: only the 3.1 model is supported
             platform_title = "Google"
         self.platform_value_label.setText(platform_title)
         self.model_value_label.setText(model)
@@ -7008,3 +7191,36 @@ try:
     _log(f"addon_loaded path={os.path.abspath(__file__)} __version__={__version__}")
 except Exception:
     pass
+
+
+# First-run setup wizard + anonymous startup stat. Runs once the profile (and
+# collection) is fully loaded; the wizard only appears until setup is completed.
+def _on_profile_open_freecard() -> None:
+    try:
+        _stat_on_startup()
+    except Exception as e:
+        _log(f"startup stat error {e!r}")
+    try:
+        if _get_config().get("setup_done"):
+            return
+
+        def _show_wizard() -> None:
+            try:
+                if _get_config().get("setup_done"):
+                    return
+                SetupWizard(mw).exec()
+            except Exception as e:
+                _log(f"first-run wizard error {e!r}")
+
+        # Defer briefly so the main window is fully painted before the modal opens.
+        QTimer.singleShot(400, _show_wizard)
+    except Exception as e:
+        _log(f"first-run wizard check error {e!r}")
+
+
+try:
+    from aqt import gui_hooks as _gui_hooks
+    _gui_hooks.profile_did_open.append(_on_profile_open_freecard)
+    _log("startup: profile_did_open hook registered (first-run wizard + stats)")
+except Exception as e:
+    _log(f"startup: profile hook registration error {e!r}")
